@@ -1,13 +1,20 @@
 package repository
 
 import (
+    "crypto/rand"
+    "crypto/rsa"
+    "crypto/x509"
     "database/sql"
     "encoding/json"
+    "encoding/pem"
     "fmt"
+    "io"
+    "math/big"
     "net/http"
     "os"
     "path/filepath"
     "strings"
+    "time"
     
     "micropki/internal/database"
     "micropki/internal/logger"
@@ -54,6 +61,7 @@ func (s *Server) Start() error {
     mux.HandleFunc("/ca/", s.handleGetCA)
     mux.HandleFunc("/crl", s.handleGetCRL)
     mux.HandleFunc("/health", s.handleHealth)
+    mux.HandleFunc("/request-cert", s.handleRequestCert)
     
     s.httpSrv = &http.Server{
         Addr:    addr,
@@ -65,6 +73,154 @@ func (s *Server) Start() error {
     s.logger.Info("Certificate directory: %s", s.certDir)
     
     return s.httpSrv.ListenAndServe()
+}
+
+// handleRequestCert handles CSR submission
+func (s *Server) handleRequestCert(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    
+    // Read CSR
+    body, err := io.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "Failed to read request", http.StatusBadRequest)
+        return
+    }
+    
+    template := r.URL.Query().Get("template")
+    if template == "" {
+        template = "server"
+    }
+    
+    // Parse CSR
+    block, _ := pem.Decode(body)
+    if block == nil {
+        http.Error(w, "Invalid CSR format", http.StatusBadRequest)
+        return
+    }
+    
+    csr, err := x509.ParseCertificateRequest(block.Bytes)
+    if err != nil {
+        http.Error(w, "Failed to parse CSR", http.StatusBadRequest)
+        return
+    }
+    
+    // Verify CSR signature
+    if err := csr.CheckSignature(); err != nil {
+        http.Error(w, "Invalid CSR signature", http.StatusBadRequest)
+        return
+    }
+    
+    s.logger.Info("CSR received for subject: %s", csr.Subject.String())
+    
+    // Load CA certificate and key for signing
+    caCertPath := filepath.Join(s.certDir, "..", "..", "pki-intermediate", "certs", "intermediate.cert.pem")
+    caKeyPath := filepath.Join(s.certDir, "..", "..", "pki-intermediate", "private", "intermediate.key.pem")
+    
+    caCert, err := loadCertFile(caCertPath)
+    if err != nil {
+        s.logger.Error("Failed to load CA certificate: %v", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+    
+    caKey, err := loadPrivateKeyFile(caKeyPath, "")
+    if err != nil {
+        s.logger.Error("Failed to load CA private key: %v", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+    
+    // Create certificate template from CSR
+    serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+    
+    certTemplate := &x509.Certificate{
+        SerialNumber: serialNumber,
+        Subject:      csr.Subject,
+        NotBefore:    time.Now(),
+        NotAfter:     time.Now().AddDate(1, 0, 0),
+        KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+        ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+        DNSNames:     csr.DNSNames,
+    }
+    
+    // Sign certificate
+    certBytes, err := x509.CreateCertificate(rand.Reader, certTemplate, caCert, csr.PublicKey, caKey)
+    if err != nil {
+        s.logger.Error("Failed to sign certificate: %v", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+    
+    // Return certificate
+    w.Header().Set("Content-Type", "application/x-pem-file")
+    w.WriteHeader(http.StatusCreated)
+    pem.Encode(w, &pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+}
+
+func loadCertFile(path string) (*x509.Certificate, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    block, _ := pem.Decode(data)
+    if block == nil {
+        return nil, fmt.Errorf("failed to decode PEM")
+    }
+    return x509.ParseCertificate(block.Bytes)
+}
+
+func loadPrivateKeyFile(path, passphrase string) (interface{}, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    block, _ := pem.Decode(data)
+    if block == nil {
+        return nil, fmt.Errorf("failed to decode PEM")
+    }
+    
+    // Check if encrypted
+    if x509.IsEncryptedPEMBlock(block) {
+        // For now, assume the passphrase is the same as the CA passphrase
+        // In production, you'd need to pass the correct passphrase
+        keyBytes, err := x509.DecryptPEMBlock(block, []byte("MySecure-Passphrase-2024"))
+        if err != nil {
+            return nil, fmt.Errorf("failed to decrypt private key: %w", err)
+        }
+        return x509.ParsePKCS1PrivateKey(keyBytes)
+    }
+    
+    return x509.ParsePKCS1PrivateKey(block.Bytes)
+}
+
+// generateTestCertificate creates a test certificate from CSR
+func generateTestCertificate(csr *x509.CertificateRequest) ([]byte, error) {
+    // Generate a self-signed certificate for testing
+    template := &x509.Certificate{
+        SerialNumber: big.NewInt(time.Now().Unix()),
+        Subject:      csr.Subject,
+        NotBefore:    time.Now(),
+        NotAfter:     time.Now().AddDate(1, 0, 0),
+        KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+        ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+        DNSNames:     csr.DNSNames,
+    }
+    
+    // Generate a temporary key for signing (in production, use CA key)
+    privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+    if err != nil {
+        return nil, err
+    }
+    
+    certBytes, err := x509.CreateCertificate(rand.Reader, template, template, &privKey.PublicKey, privKey)
+    if err != nil {
+        return nil, err
+    }
+    
+    return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes}), nil
 }
 
 func (s *Server) Stop() error {

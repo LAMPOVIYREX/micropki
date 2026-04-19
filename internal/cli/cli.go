@@ -1,13 +1,14 @@
 package cli
 
 import (
-    stdCrypto "crypto"
+    "bytes"
     "crypto/rand"
     "crypto/rsa"
     "crypto/x509"
     "encoding/json"
     "encoding/pem"
     "fmt"
+    "io"
     "math/big"
     "net/http"
     "os"
@@ -20,12 +21,15 @@ import (
     "github.com/spf13/cobra"
     "micropki/internal/ca"
     "micropki/internal/certs"
+    "micropki/internal/client"
     "micropki/internal/crl"
     myCrypto "micropki/internal/crypto"
     "micropki/internal/database"
     "micropki/internal/logger"
     "micropki/internal/ocsp"
     "micropki/internal/repository"
+    "micropki/internal/revocation"
+    "micropki/internal/validation"
     "micropki/pkg/types"
 )
 
@@ -64,7 +68,8 @@ func NewRootCmd() *cobra.Command {
     cmd.AddCommand(newCertCmd())
     cmd.AddCommand(newDBCmd())    
     cmd.AddCommand(newRepoCmd()) 
-    cmd.AddCommand(newOCSPCmd()) 
+    cmd.AddCommand(newOCSPCmd())
+    cmd.AddCommand(newClientCmd()) 
     
     return cmd
 }
@@ -727,7 +732,6 @@ func newCAGenCRLCmd() *cobra.Command {
     return cmd
 }
 
-// loadCertificate helper function
 func loadCertificate(path string) (*x509.Certificate, error) {
     data, err := os.ReadFile(path)
     if err != nil {
@@ -928,7 +932,7 @@ func newCAIssueOCSPCertCmd() *cobra.Command {
     return cmd
 }
 
-func loadPrivateKey(path, passphraseFile string) (stdCrypto.PrivateKey, error) {
+func loadPrivateKey(path, passphraseFile string) (interface{}, error) {
     data, err := os.ReadFile(path)
     if err != nil {
         return nil, err
@@ -939,6 +943,7 @@ func loadPrivateKey(path, passphraseFile string) (stdCrypto.PrivateKey, error) {
         return nil, fmt.Errorf("failed to decode PEM block")
     }
     
+    // Check if encrypted
     if x509.IsEncryptedPEMBlock(block) {
         if passphraseFile == "" {
             return nil, fmt.Errorf("encrypted key requires passphrase")
@@ -957,7 +962,210 @@ func loadPrivateKey(path, passphraseFile string) (stdCrypto.PrivateKey, error) {
         return x509.ParsePKCS1PrivateKey(keyBytes)
     }
     
+    // Unencrypted
     return x509.ParsePKCS1PrivateKey(block.Bytes)
 }
 
 
+// ==================== CLIENT COMMANDS ====================
+
+func newClientCmd() *cobra.Command {
+    cmd := &cobra.Command{
+        Use:   "client",
+        Short: "Client operations (CSR, validation, revocation check)",
+    }
+    
+    cmd.AddCommand(newClientGenCSRCmd())
+    cmd.AddCommand(newClientRequestCertCmd())
+    cmd.AddCommand(newClientValidateCmd())
+    cmd.AddCommand(newClientCheckStatusCmd())
+    
+    return cmd
+}
+
+func newClientGenCSRCmd() *cobra.Command {
+    var subject, keyType, outKey, outCSR string
+    var keySize int
+    var sans []string
+    
+    cmd := &cobra.Command{
+        Use:   "gen-csr",
+        Short: "Generate private key and CSR",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            fmt.Printf("Generating CSR for subject: %s\n", subject)
+            
+            err := client.GenerateCSR(subject, keyType, keySize, sans, outKey, outCSR)
+            if err != nil {
+                return err
+            }
+            
+            fmt.Printf("Private key saved to: %s (unencrypted, permissions 0600)\n", outKey)
+            fmt.Printf("CSR saved to: %s\n", outCSR)
+            return nil
+        },
+    }
+    
+    cmd.Flags().StringVar(&subject, "subject", "", "Certificate subject")
+    cmd.Flags().StringVar(&keyType, "key-type", "rsa", "Key type (rsa, ecc)")
+    cmd.Flags().IntVar(&keySize, "key-size", 2048, "Key size (2048/4096 for RSA, 256/384 for ECC)")
+    cmd.Flags().StringSliceVar(&sans, "san", []string{}, "Subject Alternative Names")
+    cmd.Flags().StringVar(&outKey, "out-key", "./key.pem", "Output private key file")
+    cmd.Flags().StringVar(&outCSR, "out-csr", "./request.csr.pem", "Output CSR file")
+    
+    cmd.MarkFlagRequired("subject")
+    
+    return cmd
+}
+
+func newClientRequestCertCmd() *cobra.Command {
+    var csrPath, template, caURL, outCert string
+    
+    cmd := &cobra.Command{
+        Use:   "request-cert",
+        Short: "Submit CSR to CA and get certificate",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            fmt.Printf("Submitting CSR to CA at %s\n", caURL)
+            
+            csrData, err := os.ReadFile(csrPath)
+            if err != nil {
+                return fmt.Errorf("failed to read CSR: %w", err)
+            }
+            
+            resp, err := http.Post(caURL+"/request-cert?template="+template, "application/x-pem-file", bytes.NewReader(csrData))
+            if err != nil {
+                return fmt.Errorf("failed to submit CSR: %w", err)
+            }
+            defer resp.Body.Close()
+            
+            if resp.StatusCode != http.StatusCreated {
+                body, _ := io.ReadAll(resp.Body)
+                return fmt.Errorf("CA returned error: %s", string(body))
+            }
+            
+            certData, err := io.ReadAll(resp.Body)
+            if err != nil {
+                return fmt.Errorf("failed to read response: %w", err)
+            }
+            
+            if err := os.WriteFile(outCert, certData, 0644); err != nil {
+                return fmt.Errorf("failed to save certificate: %w", err)
+            }
+            
+            fmt.Printf("Certificate saved to: %s\n", outCert)
+            return nil
+        },
+    }
+    
+    cmd.Flags().StringVar(&csrPath, "csr", "", "Path to CSR file")
+    cmd.Flags().StringVar(&template, "template", "server", "Certificate template (server, client, code_signing)")
+    cmd.Flags().StringVar(&caURL, "ca-url", "http://localhost:8080", "CA repository URL")
+    cmd.Flags().StringVar(&outCert, "out-cert", "./cert.pem", "Output certificate file")
+    
+    cmd.MarkFlagRequired("csr")
+    
+    return cmd
+}
+
+func newClientValidateCmd() *cobra.Command {
+    var certPath, trustedPath, mode string
+    var crlURL, ocspURL string
+    var untrustedPaths []string
+    
+    cmd := &cobra.Command{
+        Use:   "validate",
+        Short: "Validate certificate chain",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            fmt.Printf("Validating certificate: %s\n", certPath)
+            fmt.Printf("Mode: %s\n", mode)
+            
+            // Create validator
+            validator, err := validation.NewValidator(trustedPath, time.Now())
+            if err != nil {
+                return err
+            }
+            
+            // Load intermediates
+            for _, path := range untrustedPaths {
+                cert, err := loadCertificate(path)
+                if err != nil {
+                    return fmt.Errorf("failed to load intermediate: %w", err)
+                }
+                validator.AddIntermediate(cert)
+            }
+            
+            // Validate
+            result, err := validator.ValidateCertificate(certPath, untrustedPaths)
+            if err != nil {
+                return err
+            }
+            
+            // Print results
+            fmt.Println("\n=== Validation Results ===")
+            for _, step := range result.Steps {
+                status := "✓"
+                if !step.Passed {
+                    status = "✗"
+                }
+                fmt.Printf("%s %s: %s\n", status, step.Name, step.Message)
+            }
+            
+            if result.Passed {
+                fmt.Println("\n✓ Certificate chain is VALID")
+            } else {
+                fmt.Printf("\n✗ Certificate chain is INVALID: %s\n", result.ErrorMsg)
+                return fmt.Errorf("validation failed")
+            }
+            
+            return nil
+        },
+    }
+    
+    cmd.Flags().StringVar(&certPath, "cert", "", "Path to leaf certificate")
+    cmd.Flags().StringSliceVar(&untrustedPaths, "untrusted", []string{}, "Intermediate certificate paths")
+    cmd.Flags().StringVar(&trustedPath, "trusted", "./pki/certs/ca.cert.pem", "Trusted root certificate")
+    cmd.Flags().StringVar(&crlURL, "crl", "", "CRL URL for revocation check")
+    cmd.Flags().StringVar(&ocspURL, "ocsp-url", "", "OCSP responder URL")
+    cmd.Flags().StringVar(&mode, "mode", "full", "Validation mode (chain, full)")
+    
+    cmd.MarkFlagRequired("cert")
+    
+    return cmd
+}
+
+func newClientCheckStatusCmd() *cobra.Command {
+    var certPath, issuerPath, crlURL, ocspURL string
+    
+    cmd := &cobra.Command{
+        Use:   "check-status",
+        Short: "Check certificate revocation status",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            fmt.Printf("Checking revocation status for: %s\n", certPath)
+            
+            checker := revocation.NewChecker()
+            status, err := checker.CheckStatus(certPath, issuerPath, crlURL, ocspURL)
+            if err != nil {
+                return err
+            }
+            
+            fmt.Printf("\n=== Revocation Status ===\n")
+            fmt.Printf("Status: %s\n", status.Status)
+            fmt.Printf("Method: %s\n", status.Method)
+            if status.Status == "revoked" {
+                fmt.Printf("Revocation time: %s\n", status.RevocationTime.Format(time.RFC3339))
+                fmt.Printf("Revocation reason: %s\n", status.RevocationReason)
+            }
+            
+            return nil
+        },
+    }
+    
+    cmd.Flags().StringVar(&certPath, "cert", "", "Path to certificate")
+    cmd.Flags().StringVar(&issuerPath, "ca-cert", "", "Issuer CA certificate")
+    cmd.Flags().StringVar(&crlURL, "crl", "", "CRL file or URL")
+    cmd.Flags().StringVar(&ocspURL, "ocsp-url", "", "OCSP responder URL")
+    
+    cmd.MarkFlagRequired("cert")
+    cmd.MarkFlagRequired("ca-cert")
+    
+    return cmd
+}
