@@ -4,30 +4,36 @@ import (
     "crypto"
     "crypto/x509"
     "database/sql"
+    "encoding/asn1"
     "encoding/json"
     "encoding/pem"
     "fmt"
     "io"
+    "math/big"
     "net/http"
     "os"
     "time"
+    "golang.org/x/crypto/ocsp"
     
     "micropki/internal/database"
     "micropki/internal/logger"
     myCrypto "micropki/internal/crypto"
+    "micropki/internal/ratelimit"
 )
 
 // OCSPResponder handles OCSP requests
 type OCSPResponder struct {
-    db             *sql.DB
-    caCert         *x509.Certificate
-    responderCert  *x509.Certificate
-    responderKey   crypto.PrivateKey
-    logger         *logger.Logger
+    db            *sql.DB
+    caCert        *x509.Certificate
+    responderCert *x509.Certificate
+    responderKey  crypto.PrivateKey
+    logger        *logger.Logger
+    rateLimiter   *ratelimit.RateLimiter
+    cacheTTL      int 
 }
 
 // NewOCSPResponder creates a new OCSP responder
-func NewOCSPResponder(dbPath, caCertPath, responderCertPath, responderKeyPath, passphraseFile string, cacheTTL int, log *logger.Logger) (*OCSPResponder, error) {
+func NewOCSPResponder(dbPath, caCertPath, responderCertPath, responderKeyPath, passphraseFile string, cacheTTL int, log *logger.Logger, rateLimit, rateBurst int) (*OCSPResponder, error) {
     // Open database
     db, err := database.InitDB(dbPath)
     if err != nil {
@@ -54,58 +60,120 @@ func NewOCSPResponder(dbPath, caCertPath, responderCertPath, responderKeyPath, p
         db.Close()
         return nil, fmt.Errorf("failed to load responder private key: %w", err)
     }
-    
+
+    var rl *ratelimit.RateLimiter
+    if rateLimit > 0 {
+        rl = ratelimit.NewRateLimiter(rateLimit, rateBurst)
+    }
     return &OCSPResponder{
         db:            db,
         caCert:        caCert,
         responderCert: responderCert,
         responderKey:  responderKey,
         logger:        log,
+        rateLimiter:   rl,
+        cacheTTL:      cacheTTL,
     }, nil
 }
 
-// Close closes database connection
-func (r *OCSPResponder) Close() error {
-    return r.db.Close()
+func (r *OCSPResponder) Start(host string, port int) error {
+    addr := fmt.Sprintf("%s:%d", host, port)
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", r.HandleOCSPRequest)
+
+    var finalHandler http.Handler = mux
+    if r.rateLimiter != nil {
+        finalHandler = r.rateLimiter.Middleware(finalHandler)
+    }
+
+    r.logger.Info("Starting OCSP responder on %s", addr)
+    return http.ListenAndServe(addr, finalHandler)
 }
 
 // HandleOCSPRequest processes OCSP requests
-// HandleOCSPRequest processes OCSP requests
 func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Request) {
     startTime := time.Now()
-    
-    var serialHex string
-    
-    // Handle GET requests with query parameter
-    if req.Method == http.MethodGet {
-        serialHex = req.URL.Query().Get("serial")
-        if serialHex == "" {
-            serialHex = req.URL.Query().Get("serialNumber")
-        }
-    } else if req.Method == http.MethodPost {
-        // Read request body
-        body, err := io.ReadAll(req.Body)
-        if err != nil {
-            r.logger.Error("Failed to read request body: %v", err)
-            http.Error(w, "Failed to read request", http.StatusBadRequest)
-            return
-        }
-        serialHex = extractSerialFromRequest(body)
-    } else {
+
+    if req.Method != http.MethodPost {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
-    
-    // Get certificate status
-    status, _, _ := r.getCertificateStatus(serialHex)
-    
+
+    if req.Header.Get("Content-Type") != "application/ocsp-request" {
+        http.Error(w, "Invalid Content-Type", http.StatusBadRequest)
+        return
+    }
+
+    body, err := io.ReadAll(req.Body)
+    if err != nil {
+        r.logger.Error("Failed to read request body: %v", err)
+        http.Error(w, "Failed to read request", http.StatusBadRequest)
+        return
+    }
+
+    // Альтернативный парсинг ASN.1 для извлечения серийного номера
+    var reqAsn1 struct {
+        TBSRequest struct {
+            RequestList []struct {
+                ReqCert struct {
+                    SerialNumber *big.Int
+                }
+            }
+        }
+    }
+    if _, err := asn1.Unmarshal(body, &reqAsn1); err != nil {
+        r.logger.Error("Failed to parse ASN.1: %v", err)
+        http.Error(w, "Invalid OCSP request", http.StatusBadRequest)
+        return
+    }
+    if len(reqAsn1.TBSRequest.RequestList) == 0 {
+        http.Error(w, "No certificate in request", http.StatusBadRequest)
+        return
+    }
+    serialHex := fmt.Sprintf("%X", reqAsn1.TBSRequest.RequestList[0].ReqCert.SerialNumber)
+
+    // Получение статуса из БД
+    status, revokedAt, reasonCode := r.getCertificateStatus(serialHex)
+
+    // Формирование ответа
+    var template ocsp.Response
+    template.SerialNumber = reqAsn1.TBSRequest.RequestList[0].ReqCert.SerialNumber
+    template.IssuerHash = crypto.SHA1
+    template.ProducedAt = time.Now()
+    template.ThisUpdate = time.Now()
+    template.NextUpdate = time.Now().Add(time.Duration(r.cacheTTL) * time.Second)
+
+    switch status {
+    case "good":
+        template.Status = ocsp.Good
+    case "revoked":
+        template.Status = ocsp.Revoked
+        template.RevokedAt = revokedAt
+        template.RevocationReason = reasonCode
+    default:
+        template.Status = ocsp.Unknown
+    }
+
+    signer, ok := r.responderKey.(crypto.Signer)
+    if !ok {
+        r.logger.Error("Responder key does not implement crypto.Signer")
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+
+    respBytes, err := ocsp.CreateResponse(r.responderCert, r.caCert, template, signer)
+    if err != nil {
+        r.logger.Error("Failed to create OCSP response: %v", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+
     r.logger.Info("OCSP request: serial=%s, status=%s, client=%s, time=%dms",
         serialHex, status, req.RemoteAddr, time.Since(startTime).Milliseconds())
-    
-    // Return simple response
+
     w.Header().Set("Content-Type", "application/ocsp-response")
     w.WriteHeader(http.StatusOK)
-    w.Write([]byte(fmt.Sprintf("OCSP Response: %s", status)))
+    w.Write(respBytes)
 }
 
 // extractSerialFromRequest extracts serial number from OCSP request (simplified)
@@ -252,4 +320,17 @@ func getReasonCode(reason string) int {
         return code
     }
     return 0
+}
+
+// Stop останавливает OCSP сервер (заглушка, так как сервер запускается через http.ListenAndServe)
+func (r *OCSPResponder) Stop() error {
+    return nil
+}
+
+// Close закрывает соединение с базой данных
+func (r *OCSPResponder) Close() error {
+    if r.db != nil {
+        return r.db.Close()
+    }
+    return nil
 }

@@ -150,3 +150,22 @@ func UpdateCertificateStatus(db *sql.DB, serialHex, status, reason string) error
     
     return nil
 }
+
+// AddCompromisedKey records a compromised public key
+func AddCompromisedKey(db *sql.DB, pubKeyHash, serial, reason string) error {
+    _, err := db.Exec(`INSERT OR IGNORE INTO compromised_keys 
+        (public_key_hash, certificate_serial, compromise_date, compromise_reason)
+        VALUES (?, ?, ?, ?)`,
+        pubKeyHash, serial, time.Now().Format(time.RFC3339), reason)
+    return err
+}
+
+// IsKeyCompromised checks if a public key hash is compromised
+func IsKeyCompromised(db *sql.DB, pubKeyHash string) (bool, error) {
+    var count int
+    err := db.QueryRow("SELECT COUNT(*) FROM compromised_keys WHERE public_key_hash = ?", pubKeyHash).Scan(&count)
+    if err != nil {
+        return false, err
+    }
+    return count > 0, nil
+}

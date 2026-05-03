@@ -2,6 +2,7 @@ package crl
 
 import (
     "crypto"
+    "crypto/rand"
     "crypto/x509"
     "crypto/x509/pkix"
     "encoding/asn1"
@@ -47,53 +48,26 @@ var ReasonCodeMap = map[string]int{
 
 // GenerateCRL creates a new CRL (simplified for Go 1.18)
 func GenerateCRL(config *CRLConfig) ([]byte, error) {
-    // Build revoked certificates list
-    revokedList := make([]pkix.RevokedCertificate, len(config.RevokedCerts))
-    for i, cert := range config.RevokedCerts {
-        revokedList[i] = pkix.RevokedCertificate{
-            SerialNumber:   cert.SerialNumber,
-            RevocationTime: cert.RevocationTime,
+    revokedCerts := make([]pkix.RevokedCertificate, len(config.RevokedCerts))
+    for i, rc := range config.RevokedCerts {
+        revokedCerts[i] = pkix.RevokedCertificate{
+            SerialNumber:   rc.SerialNumber,
+            RevocationTime: rc.RevocationTime,
         }
-        
-        // Add reason code if specified
-        if cert.ReasonCode != 0 {
-            reasonBytes, err := asn1.Marshal(cert.ReasonCode)
-            if err != nil {
-                return nil, fmt.Errorf("failed to marshal reason code: %w", err)
-            }
-            revokedList[i].Extensions = []pkix.Extension{
-                {
-                    Id:       asn1.ObjectIdentifier{2, 5, 29, 21},
-                    Critical: false,
-                    Value:    reasonBytes,
-                },
+        if rc.ReasonCode != 0 {
+            reasonBytes, _ := asn1.Marshal(rc.ReasonCode)
+            revokedCerts[i].Extensions = []pkix.Extension{
+                {Id: asn1.ObjectIdentifier{2, 5, 29, 21}, Value: reasonBytes},
             }
         }
     }
-    
-    // Create TBSCertList structure
-    tbsCertList := pkix.TBSCertificateList{
-        Version:    1, // v2
-        Signature: pkix.AlgorithmIdentifier{
-            Algorithm: asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 11}, // sha256WithRSAEncryption
-        },
-        Issuer: config.CAIssuer.Subject.ToRDNSequence(),
-        ThisUpdate: config.ThisUpdate,
-        NextUpdate: config.NextUpdate,
-        RevokedCertificates: revokedList,
+    tbs := &x509.RevocationList{
+        RevokedCertificates: revokedCerts,
+        Number:              big.NewInt(config.Number),
+        ThisUpdate:          config.ThisUpdate,
+        NextUpdate:          config.NextUpdate,
     }
-    
-    // Marshal TBSCertList
-    tbsBytes, err := asn1.Marshal(tbsCertList)
-    if err != nil {
-        return nil, fmt.Errorf("failed to marshal TBSCertList: %w", err)
-    }
-    
-    // Create CRL bytes (simplified - just return TBSCertList for now)
-    // In production, you would sign this properly
-    crlBytes := tbsBytes
-    
-    return crlBytes, nil
+    return x509.CreateRevocationList(rand.Reader, tbs, config.CAIssuer, config.CAPrivateKey.(crypto.Signer))
 }
 
 // SaveCRL saves CRL to PEM file

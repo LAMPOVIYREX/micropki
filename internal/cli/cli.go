@@ -17,7 +17,9 @@ import (
     "strings"
     "syscall"
     "time"
-    
+    "crypto/sha256"
+    "encoding/hex"
+    "micropki/internal/audit"
     "github.com/spf13/cobra"
     "micropki/internal/ca"
     "micropki/internal/certs"
@@ -70,6 +72,7 @@ func NewRootCmd() *cobra.Command {
     cmd.AddCommand(newRepoCmd()) 
     cmd.AddCommand(newOCSPCmd())
     cmd.AddCommand(newClientCmd()) 
+    cmd.AddCommand(newAuditCmd())
     
     return cmd
 }
@@ -87,6 +90,7 @@ func newCACmd() *cobra.Command {
     cmd.AddCommand(newCARevokeCmd())      
     cmd.AddCommand(newCAGenCRLCmd()) 
     cmd.AddCommand(newCAIssueOCSPCertCmd())
+    cmd.AddCommand(newCACompromiseCmd())   
     
     return cmd
 }
@@ -340,6 +344,9 @@ func newRepoServeCmd() *cobra.Command {
         repoPort    int
         repoDBPath  string
         repoCertDir string
+        repoRateLimit  int  
+        repoRateBurst  int
+        repoCAPassphraseFile string 
     )
     
     cmd := &cobra.Command{
@@ -358,6 +365,9 @@ func newRepoServeCmd() *cobra.Command {
                 Host:    repoHost,
                 Port:    repoPort,
                 LogFile: logFile,
+                RateLimit:  repoRateLimit,   
+                RateBurst:  repoRateBurst,
+                CAPassphraseFile: repoCAPassphraseFile,
             }
             
             server, err := repository.NewServer(config, log)
@@ -383,7 +393,9 @@ func newRepoServeCmd() *cobra.Command {
     cmd.Flags().IntVar(&repoPort, "port", 8080, "TCP port")
     cmd.Flags().StringVar(&repoDBPath, "db-path", "./pki/micropki.db", "Database path")
     cmd.Flags().StringVar(&repoCertDir, "cert-dir", "./pki/certs", "Certificate directory")
-    
+    cmd.Flags().IntVar(&repoRateLimit, "rate-limit", 0, "Requests per second per client IP (0 = disabled)")
+    cmd.Flags().IntVar(&repoRateBurst, "rate-burst", 10, "Burst allowance for rate limiter")
+    cmd.Flags().StringVar(&repoCAPassphraseFile, "ca-passphrase-file", "", "Passphrase file for Intermediate CA private key")
     return cmd
 }
 
@@ -554,6 +566,9 @@ func newCARevokeCmd() *cobra.Command {
     var reason string
     var force bool
     var dbPath string
+    var caDir string
+    var caType string
+    var revokePassphraseFile string  // объявляем здесь
     
     cmd := &cobra.Command{
         Use:   "revoke <serial>",
@@ -568,7 +583,6 @@ func newCARevokeCmd() *cobra.Command {
             }
             defer log.Close()
             
-            // Validate reason
             if _, ok := crl.ReasonCodeMap[reason]; !ok {
                 return fmt.Errorf("invalid reason: %s", reason)
             }
@@ -582,22 +596,21 @@ func newCARevokeCmd() *cobra.Command {
                 }
             }
             
-            // Open database
             db, err := database.InitDB(dbPath)
             if err != nil {
                 return fmt.Errorf("failed to open database: %w", err)
             }
             defer db.Close()
             
-            // Revoke certificate
-            if err := crl.RevokeCertificate(db, serialHex, reason); err != nil {
+            // Используем revokePassphraseFile
+            err = crl.RevokeCertificate(db, serialHex, reason, caDir, caType, revokePassphraseFile)
+            if err != nil {
                 log.Error("Revocation failed: %v", err)
                 return err
             }
             
             log.Info("Certificate %s revoked with reason: %s", serialHex, reason)
             fmt.Printf("Certificate %s successfully revoked\n", serialHex)
-            
             return nil
         },
     }
@@ -605,6 +618,9 @@ func newCARevokeCmd() *cobra.Command {
     cmd.Flags().StringVar(&reason, "reason", "unspecified", "Revocation reason")
     cmd.Flags().BoolVar(&force, "force", false, "Skip confirmation")
     cmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Database path")
+    cmd.Flags().StringVar(&caDir, "ca-dir", "./pki-intermediate", "CA directory for CRL update")
+    cmd.Flags().StringVar(&caType, "ca-type", "intermediate", "CA type (root/intermediate)")
+    cmd.Flags().StringVar(&revokePassphraseFile, "passphrase-file", "", "Passphrase for CA private key")
     
     return cmd
 }
@@ -615,6 +631,7 @@ func newCAGenCRLCmd() *cobra.Command {
     var outFile string
     var dbPath string
     var caDir string
+    var passphraseFile string 
     
     cmd := &cobra.Command{
         Use:   "gen-crl",
@@ -725,7 +742,7 @@ func newCAGenCRLCmd() *cobra.Command {
     cmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Database path")
     cmd.Flags().StringVar(&caDir, "ca-dir", "./pki", "CA directory")
     cmd.Flags().StringVar(&passphraseFile, "passphrase-file", "", "Passphrase for CA private key")
-    
+    cmd.Flags().StringVar(&passphraseFile, "passphrase-file", "", "Passphrase for CA private key")
     cmd.MarkFlagRequired("ca")
     cmd.MarkFlagRequired("passphrase-file")
     
@@ -774,6 +791,8 @@ func newOCSPServeCmd() *cobra.Command {
         responderKey  string
         caCert        string
         cacheTTL      int
+        rateLimit     int 
+        rateBurst     int
     )
     
     cmd := &cobra.Command{
@@ -787,7 +806,7 @@ func newOCSPServeCmd() *cobra.Command {
             defer log.Close()
             
             responder, err := ocsp.NewOCSPResponder(
-                dbPath, caCert, responderCert, responderKey, passphraseFile, cacheTTL, log,
+                dbPath, caCert, responderCert, responderKey, passphraseFile, cacheTTL, log,rateLimit, rateBurst,
             )
             if err != nil {
                 return fmt.Errorf("failed to create OCSP responder: %w", err)
@@ -813,7 +832,8 @@ func newOCSPServeCmd() *cobra.Command {
     cmd.Flags().StringVar(&responderKey, "responder-key", "", "OCSP responder private key (PEM)")
     cmd.Flags().StringVar(&caCert, "ca-cert", "", "Issuer CA certificate (PEM)")
     cmd.Flags().IntVar(&cacheTTL, "cache-ttl", 60, "Cache TTL in seconds")
-    
+    cmd.Flags().IntVar(&rateLimit, "rate-limit", 0, "Requests per second per client IP (0 = disabled)")
+    cmd.Flags().IntVar(&rateBurst, "rate-burst", 10, "Burst allowance for rate limiter")
     cmd.MarkFlagRequired("responder-cert")
     cmd.MarkFlagRequired("responder-key")
     cmd.MarkFlagRequired("ca-cert")
@@ -1151,7 +1171,7 @@ func newClientCheckStatusCmd() *cobra.Command {
             fmt.Printf("Status: %s\n", status.Status)
             fmt.Printf("Method: %s\n", status.Method)
             if status.Status == "revoked" {
-                fmt.Printf("Revocation time: %s\n", status.RevocationTime.Format(time.RFC3339))
+                fmt.Printf("Revocation time: %s\n", status.RevocationTime)
                 fmt.Printf("Revocation reason: %s\n", status.RevocationReason)
             }
             
@@ -1167,5 +1187,196 @@ func newClientCheckStatusCmd() *cobra.Command {
     cmd.MarkFlagRequired("cert")
     cmd.MarkFlagRequired("ca-cert")
     
+    return cmd
+}
+
+// ==================== AUDIT COMMANDS ====================
+
+func newAuditCmd() *cobra.Command {
+    cmd := &cobra.Command{
+        Use:   "audit",
+        Short: "Audit log operations",
+    }
+    cmd.AddCommand(newAuditQueryCmd())
+    cmd.AddCommand(newAuditVerifyCmd())
+    return cmd
+}
+
+func newAuditQueryCmd() *cobra.Command {
+    var (
+        fromStr   string
+        toStr     string
+        level     string
+        operation string
+        serial    string
+        format    string
+        verify    bool
+        logPath   string
+    )
+    cmd := &cobra.Command{
+        Use:   "query",
+        Short: "Query audit log entries",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            var from, to time.Time
+            if fromStr != "" {
+                var err error
+                from, err = time.Parse(time.RFC3339, fromStr)
+                if err != nil {
+                    return fmt.Errorf("invalid --from timestamp: %w", err)
+                }
+            }
+            if toStr != "" {
+                var err error
+                to, err = time.Parse(time.RFC3339, toStr)
+                if err != nil {
+                    return fmt.Errorf("invalid --to timestamp: %w", err)
+                }
+            }
+            if logPath == "" {
+                logPath = "./pki/audit/audit.log"
+            }
+            entries, err := audit.QueryLog(logPath, from, to, level, operation, serial, 0)
+            if err != nil {
+                return err
+            }
+            switch format {
+            case "json":
+                enc := json.NewEncoder(os.Stdout)
+                enc.SetIndent("", "  ")
+                if err := enc.Encode(entries); err != nil {
+                    return err
+                }
+            default: // table
+                fmt.Printf("%-30s | %-10s | %-20s | %-7s | %s\n", "Timestamp", "Level", "Operation", "Status", "Message")
+                fmt.Println(strings.Repeat("-", 100))
+                for _, e := range entries {
+                    fmt.Printf("%-30s | %-10s | %-20s | %-7s | %.60s\n",
+                        e.Timestamp, e.Level, e.Operation, e.Status, e.Message)
+                }
+            }
+            if verify {
+                chainPath := filepath.Join(filepath.Dir(logPath), "chain.dat")
+                ok, errMsg, err := audit.VerifyIntegrity(logPath, chainPath)
+                if err != nil {
+                    return err
+                }
+                if !ok {
+                    return fmt.Errorf("integrity verification failed: %s", errMsg)
+                }
+                fmt.Println("Integrity verified successfully.")
+            }
+            return nil
+        },
+    }
+    cmd.Flags().StringVar(&fromStr, "from", "", "Start timestamp (ISO 8601)")
+    cmd.Flags().StringVar(&toStr, "to", "", "End timestamp (ISO 8601)")
+    cmd.Flags().StringVar(&level, "level", "", "Log level (AUDIT, INFO, ERROR)")
+    cmd.Flags().StringVar(&operation, "operation", "", "Operation type")
+    cmd.Flags().StringVar(&serial, "serial", "", "Certificate serial number")
+    cmd.Flags().StringVar(&format, "format", "table", "Output format (table, json)")
+    cmd.Flags().BoolVar(&verify, "verify", false, "Verify hash chain integrity")
+    cmd.Flags().StringVar(&logPath, "log-file", "", "Path to audit log (default ./pki/audit/audit.log)")
+    return cmd
+}
+
+func newAuditVerifyCmd() *cobra.Command {
+    var logPath, chainPath string
+    cmd := &cobra.Command{
+        Use:   "verify",
+        Short: "Verify integrity of audit log",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            if logPath == "" {
+                logPath = "./pki/audit/audit.log"
+            }
+            if chainPath == "" {
+                chainPath = filepath.Join(filepath.Dir(logPath), "chain.dat")
+            }
+            ok, errMsg, err := audit.VerifyIntegrity(logPath, chainPath)
+            if err != nil {
+                return err
+            }
+            if !ok {
+                return fmt.Errorf("integrity check failed: %s", errMsg)
+            }
+            fmt.Println("Audit log integrity verified.")
+            return nil
+        },
+    }
+    cmd.Flags().StringVar(&logPath, "log-file", "", "Path to audit log (default ./pki/audit/audit.log)")
+    cmd.Flags().StringVar(&chainPath, "chain-file", "", "Path to chain.dat (default same directory as log file)")
+    return cmd
+}
+
+func newCACompromiseCmd() *cobra.Command {
+    var (
+        certPath string
+        reason   string
+        force    bool
+        dbPath   string
+    )
+    cmd := &cobra.Command{
+        Use:   "compromise",
+        Short: "Simulate private key compromise",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            log, err := logger.NewLogger("")
+            if err != nil {
+                return err
+            }
+            defer log.Close()
+
+            if !force {
+                fmt.Printf("Are you sure you want to compromise certificate %s? [y/N]: ", certPath)
+                var resp string
+                fmt.Scanln(&resp)
+                if resp != "y" && resp != "Y" {
+                    return fmt.Errorf("operation cancelled")
+                }
+            }
+
+            // Load certificate
+            cert, err := loadCertificate(certPath)
+            if err != nil {
+                return err
+            }
+
+            // Open database
+            db, err := database.InitDB(dbPath)
+            if err != nil {
+                return err
+            }
+            defer db.Close()
+
+            // Mark as revoked in certificates table
+            serialHex := fmt.Sprintf("%X", cert.SerialNumber)
+            _, err = db.Exec(`UPDATE certificates SET status = 'revoked', revocation_reason = ?, revocation_date = ? WHERE serial_hex = ?`,
+                reason, time.Now().Format(time.RFC3339), serialHex)
+            if err != nil {
+                return err
+            }
+
+            // Compute public key hash (SHA-256 of SPKI)
+            pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+            if err != nil {
+                return err
+            }
+            hash := sha256.Sum256(pubDER)
+            pubKeyHash := hex.EncodeToString(hash[:])
+
+            // Insert into compromised_keys
+            if err := database.AddCompromisedKey(db, pubKeyHash, serialHex, reason); err != nil {
+                log.Warning("Failed to record compromised key: %v", err)
+            }
+
+            log.Info("Certificate %s marked as compromised (reason: %s)", serialHex, reason)
+            fmt.Printf("Certificate %s has been compromised and revoked.\n", serialHex)
+            return nil
+        },
+    }
+
+    cmd.Flags().StringVar(&certPath, "cert", "", "Path to certificate file")
+    cmd.Flags().StringVar(&reason, "reason", "keyCompromise", "Compromise reason")
+    cmd.Flags().BoolVar(&force, "force", false, "Skip confirmation")
+    cmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Database path")
+    cmd.MarkFlagRequired("cert")
     return cmd
 }

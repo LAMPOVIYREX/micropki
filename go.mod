@@ -6,6 +6,8 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.40
 	github.com/spf13/cobra v1.7.0
 	github.com/stretchr/testify v1.8.4
+	golang.org/x/crypto v0.50.0
+	golang.org/x/time v0.15.0
 )
 
 require (

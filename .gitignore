@@ -1,39 +1,65 @@
 # Binaries
+/micropki
+/micropki.exe
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-micropki
 
-# Test binary
+# Test binaries
 *.test
+*.out
 
-# Output directories
+# Generated PKI directories
+/test-ca/
 /pki/
-/output/
+/pki-intermediate/
+/out/
+/logs/
+/coverage/
+
+# Generated files
+*.log
+*.txt
+*.pem
+*.crt
+*.key
+*.csr
+*.der
+*.crl
+
+# Audit and CT logs
+pki/audit/
+*.db
+*.db-journal
+ct.log
+chain.dat
+
+# Temp files
+*tmp
+*.temp
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# Vendor
+/vendor/
+
+# Go sum
+go.sum
 
 # IDE
 .idea/
 .vscode/
-*.swp
-*.swo
-*~
+*.iml
+*.ipr
+*.iws
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-
-# Logs
-*.log
-/logs/
-
-# Database files
-*.db
-*.db-journal
-micropki.db
+*.bak
+*.old
