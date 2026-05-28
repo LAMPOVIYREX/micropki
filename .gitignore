@@ -1,0 +1,45 @@
+# Binaries
+/micropki
+/micropki.exe
+*.test
+*.out
+
+# Generated files
+/pki/
+/pki-intermediate/
+/test-ca/
+/audit/
+/logs/
+/coverage.html
+/coverage.out
+/coverage.txt
+*.log
+*.pem
+*.key
+*.crt
+*.csr
+*.crl
+*.db
+*.db-journal
+
+# Temporary files
+/tmp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Demo temp
+/demo/micropki
+
+# Go artifacts
+go1.21.5.linux-amd64.tar.gz
