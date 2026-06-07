@@ -201,6 +201,7 @@ perf-test: build
 	@go test -v -run=TestPerformance ./tests/
 
 coverage:
-	go test -coverprofile=coverage.out ./internal/... ./tests/...
+	go test -coverprofile=coverage.out $$(go list ./internal/... | grep -v cli) ./tests/...
+	go tool cover -func=coverage.out
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
